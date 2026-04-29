@@ -1,0 +1,21 @@
+--cpu Cortex-M0
+".\objects\main.o"
+".\objects\clock_app.o"
+".\objects\pfpa.o"
+".\objects\gpio.o"
+".\objects\wdt.o"
+".\objects\spi0.o"
+".\objects\utility.o"
+".\objects\i2c0.o"
+".\objects\ct16b0.o"
+".\objects\systick.o"
+".\objects\keyscan.o"
+".\objects\segment.o"
+".\objects\buzzer.o"
+".\objects\eeprom.o"
+".\objects\startup_sn32f400.o"
+".\objects\system_sn32f400.o"
+--strict --scatter ".\Objects\exp1_LED_blink.sct"
+--summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols
+--info sizes --info totals --info unused --info veneers
+--list ".\Listings\exp1_LED_blink.map" -o .\Objects\exp1_LED_blink.axf
