@@ -1,5 +1,5 @@
 
-# EDABK_GELI MCU & FPGA Contest 2026
+# EDABK_GELU MCU & FPGA Contest 2026
 
 ## Team Introduction
 
