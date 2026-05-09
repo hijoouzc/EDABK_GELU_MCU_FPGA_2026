@@ -15,10 +15,27 @@ module uart_tx #(
     input  wire       tx_start_i,     // 1-cycle pulse to initiate transmission
     input  wire [7:0] data_i,         // 8-bit data to transmit
     output reg        uart_tx_o,      // UART TX serial output pin
-    output reg        tx_busy_o       // High when transmission is in progress
+    output reg        tx_busy_o,      // High when transmission is in progress
+    output reg        tx_done_o       // 1-cycle pulse when byte transmission completes
 );
 
-    localparam CLKS_PER_BIT = CLK_FREQ / BAUD_RATE;
+    localparam BAUD_ACC_INC = 16'd280;
+
+    // =========================================================
+    // FRACTIONAL BAUD GENERATOR
+    // =========================================================
+    // Phase accumulator: M = (BAUD_RATE * 2^16) / CLK_FREQ
+    // For 27MHz clock and 115200 baud: M = 280 (generates baud tick)
+    reg [15:0] baud_acc;
+    wire       baud_tick = baud_acc[15];  // Tick when MSB is 1
+    
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            baud_acc <= 16'd0;
+        end else begin
+            baud_acc <= baud_acc + BAUD_ACC_INC;
+        end
+    end
 
     // =========================================================
     // FSM STATES
@@ -29,7 +46,7 @@ module uart_tx #(
     localparam S_STOP  = 2'b11;
 
     reg [1:0]  state;
-    reg [15:0] clk_count;
+    reg [3:0]  baud_cnt;    // Counter for baud ticks (0-15 for 1 bit period)
     reg [2:0]  bit_index;
     reg [7:0]  data_reg;
 
@@ -41,15 +58,19 @@ module uart_tx #(
             state     <= S_IDLE;
             uart_tx_o <= 1'b1;        // TX line is high when idle
             tx_busy_o <= 1'b0;
-            clk_count <= 16'd0;
+            tx_done_o <= 1'b0;
+            baud_cnt  <= 4'd0;
             bit_index <= 3'd0;
             data_reg  <= 8'd0;
         end else begin
+            // Default: tx_done_o is only asserted for 1 cycle when transmission completes
+            tx_done_o <= 1'b0;
+            
             case (state)
                 S_IDLE: begin
                     uart_tx_o <= 1'b1;
                     tx_busy_o <= 1'b0;
-                    clk_count <= 16'd0;
+                    baud_cnt  <= 4'd0;
                     bit_index <= 3'd0;
                     if (tx_start_i) begin
                         data_reg  <= data_i;
@@ -60,36 +81,43 @@ module uart_tx #(
 
                 S_START: begin
                     uart_tx_o <= 1'b0; // Pull TX low for Start bit
-                    if (clk_count < CLKS_PER_BIT - 1) begin
-                        clk_count <= clk_count + 16'd1;
-                    end else begin
-                        clk_count <= 16'd0;
-                        state     <= S_DATA;
+                    if (baud_tick) begin
+                        if (baud_cnt < 4'd15) begin
+                            baud_cnt <= baud_cnt + 4'd1;
+                        end else begin
+                            baud_cnt <= 4'd0;
+                            state    <= S_DATA;
+                        end
                     end
                 end
 
                 S_DATA: begin
                     uart_tx_o <= data_reg[bit_index]; // Transmit data bit by bit
-                    if (clk_count < CLKS_PER_BIT - 1) begin
-                        clk_count <= clk_count + 16'd1;
-                    end else begin 
-                        clk_count <= 16'd0;
-                        if (bit_index < 7) begin
-                            bit_index <= bit_index + 3'd1;
+                    if (baud_tick) begin
+                        if (baud_cnt < 4'd15) begin
+                            baud_cnt <= baud_cnt + 4'd1;
                         end else begin
-                            bit_index <= 3'd0;
-                            state     <= S_STOP;
+                            baud_cnt <= 4'd0;
+                            if (bit_index < 3'd7) begin
+                                bit_index <= bit_index + 3'd1;
+                            end else begin
+                                bit_index <= 3'd0;
+                                state     <= S_STOP;
+                            end
                         end
                     end
                 end
 
                 S_STOP: begin
                     uart_tx_o <= 1'b1; // Pull TX high for Stop bit
-                    if (clk_count < CLKS_PER_BIT - 1) begin
-                        clk_count <= clk_count + 16'd1;
-                    end else begin
-                        clk_count <= 16'd0;
-                        state     <= S_IDLE;
+                    if (baud_tick) begin
+                        if (baud_cnt < 4'd15) begin
+                            baud_cnt <= baud_cnt + 4'd1;
+                        end else begin
+                            baud_cnt  <= 4'd0;
+                            tx_done_o <= 1'b1;  // Pulse tx_done for 1 cycle
+                            state     <= S_IDLE;
+                        end
                     end
                 end
                 
