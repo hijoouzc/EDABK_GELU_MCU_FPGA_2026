@@ -215,10 +215,8 @@ module uart_frame_parser (
                         end else begin
                             tx_idx <= tx_idx + 4'd1;
                         end
-                    end
-                    
-                    // Load and send data when TX module is idle
-                    if (!tx_busy_i && !tx_en_o) begin
+                    end else if (!tx_busy_i && !tx_en_o) begin
+                        // Load and send data when TX module is idle and we haven't enabled it yet this cycle
                         // Prepare byte to transmit
                         if (tx_idx == tx_len_total - 1'b1) begin
                             // This is the checksum byte

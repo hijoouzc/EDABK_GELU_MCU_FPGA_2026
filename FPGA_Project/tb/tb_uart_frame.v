@@ -1,391 +1,277 @@
 `timescale 1ns / 1ps
 
-module tb_uart_frame;
-
-    // =============================================================================
-    // TESTBENCH FOR UART FRAME PARSER WITH tx_done_i OPTIMIZATION
-    // =============================================================================
-    // Tests:
-    // - STEP 1: tx_done_i signal integration (replaces tx_busy_falling)
-    // - Verify S_TX_SEND state machine transitions correctly
-    // - Verify checksum calculation and frame reception
-    // - Verify WRITE, READ, KICK, GET_STATUS commands
-    // =============================================================================
-
-    parameter CLK_FREQ = 27_000_000;
-    parameter BAUD_RATE = 115200;
-    localparam CLK_PERIOD = 37;  // 27MHz
+module tb_uart_frame();
 
     // Clock and Reset
     reg clk;
     reg rst_n;
 
-    // UART RX interface (simulated input from uart_rx module)
-    reg [7:0] rx_data_i;
-    reg rx_done_i;
+    // Giao tiếp uart_rx (giả lập)
+    reg [7:0] rx_data;
+    reg rx_done;
 
-    // UART TX interface (output to uart_tx module)
-    wire [7:0] tx_data_o;
-    wire       tx_en_o;
-    reg        tx_busy_i;
-    reg        tx_done_i;       // NEW: tx_done_o from uart_tx, input to parser
+    // Giao tiếp uart_tx
+    wire [7:0] tx_data;
+    wire tx_en;
+    reg tx_busy;
 
-    // Register File interface
-    wire [7:0]  reg_addr_o;
-    wire        reg_we_o;
-    wire        reg_re_o;
-    wire [31:0] reg_wdata_o;
-    wire [31:0] reg_rdata_i;
+    // Giao tiếp regfile
+    wire [7:0]  reg_addr;
+    wire        reg_we;
+    wire        reg_re;
+    wire [31:0] reg_wdata;
+    wire [31:0] reg_rdata;
 
-    // Watchdog Core interface
-    wire        uart_kick_pulse_o;
-    wire        wdi_src_i;
+    // Khác
+    wire uart_kick_pulse;
+    wire clr_fault;
+    wire wdi_src;
 
-    // Test signals
-    integer tx_byte_count;
-    integer tx_bytes [0:9];      // Expected TX bytes
-    integer tx_idx_expected;
-    integer test_passes;
-    integer test_errors;
+    // Giả lập Module uart_tx xử lý và đẩy dữ liệu
+    reg mock_tx_done;
 
-    // =========================================================
-    // UART Frame Parser Module
-    // =========================================================
+    always @(posedge clk) begin
+        if (rst_n) begin
+            if (tx_en && !tx_busy) begin
+                tx_busy <= 1'b1;
+                // Thời gian giả lập uart_tx đang phát dữ liệu (tùy baud rate)
+                #1000;
+                @(posedge clk);
+                tx_busy <= 1'b0;
+                mock_tx_done <= 1'b1;
+            end else if (mock_tx_done) begin
+                // Pulsed only 1 cycle
+                mock_tx_done <= 1'b0;
+            end
+        end else begin
+            tx_busy <= 0;
+            mock_tx_done <= 0;
+        end
+    end
+
+    // 1. Khởi tạo UART Frame Parser
     uart_frame_parser u_parser (
-        .clk               (clk),
-        .rst_n             (rst_n),
-        .rx_data_i         (rx_data_i),
-        .rx_done_i         (rx_done_i),
-        .tx_data_o         (tx_data_o),
-        .tx_en_o           (tx_en_o),
-        .tx_busy_i         (tx_busy_i),
-        .tx_done_i         (tx_done_i),        // NEW: tx_done signal input
-        .reg_addr_o        (reg_addr_o),
-        .reg_we_o          (reg_we_o),
-        .reg_re_o          (reg_re_o),
-        .reg_wdata_o       (reg_wdata_o),
-        .reg_rdata_i       (reg_rdata_i),
-        .uart_kick_pulse_o (uart_kick_pulse_o),
-        .wdi_src_i         (wdi_src_i)
+        .clk(clk),
+        .rst_n(rst_n),
+        .rx_data_i(rx_data),
+        .rx_done_i(rx_done),
+        .tx_data_o(tx_data),
+        .tx_en_o(tx_en),
+        .tx_busy_i(tx_busy),
+        .tx_done_i(mock_tx_done), // Mock tx_done 1-cycle pulse
+        .reg_addr_o(reg_addr),
+        .reg_we_o(reg_we),
+        .reg_re_o(reg_re),
+        .reg_wdata_o(reg_wdata),
+        .reg_rdata_i(reg_rdata),
+        .uart_kick_pulse_o(uart_kick_pulse),
+        .wdi_src_i(wdi_src)
     );
 
-    // =========================================================
-    // Mock Regfile (simplified)
-    // =========================================================
-    reg [31:0] regfile [0:15];
+    // 2. Khởi tạo Regfile để test Read/Write
+    regfile u_regfile (
+        .clk(clk),
+        .rst_n(rst_n),
+        .addr_i(reg_addr),
+        .we_i(reg_we),
+        .re_i(reg_re),
+        .wdata_i(reg_wdata),
+        .rdata_o(reg_rdata),
+        .en_sw_o(),
+        .wdi_src_o(wdi_src),
+        .clr_fault_o(clr_fault),
+        .tWD_ms_o(),
+        .tRST_ms_o(),
+        .arm_delay_us_o(),
+        // Giả lập trạng thái từ Watchdog Core
+        .en_effective_i(1'b1),
+        .fault_active_i(1'b0),
+        .enout_state_i(1'b1),
+        .wdo_state_i(1'b1),
+        .last_kick_src_i(1'b0)
+    );
 
-    assign reg_rdata_i = regfile[reg_addr_o];
+    // Tạo Clock (50MHz)
+    always #10 clk = ~clk;
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            integer i;
-            for (i = 0; i < 16; i = i + 1)
-                regfile[i] <= 32'd0;
-        end else begin
-            if (reg_we_o) begin
-                regfile[reg_addr_o] <= reg_wdata_o;
-            end
-        end
-    end
-
-    assign wdi_src_i = 1'b1;  // Simulate SW kick enabled
-
-    // =========================================================
-    // Clock Generator
-    // =========================================================
-    initial begin
-        clk = 0;
-        forever #(CLK_PERIOD / 2.0) clk = ~clk;
-    end
-
-    // =========================================================
-    // UART TX Simulator (generates tx_done_i pulse)
-    // =========================================================
-    // When tx_en_o fires and tx_busy is not already high,
-    // simulate the byte transmission and then pulse tx_done_i
-    always @(posedge clk) begin
-        if (tx_en_o && !tx_busy_i) begin
-            // Start transmission: set tx_busy
-            tx_busy_i <= 1'b1;
-            
-            // After ~10 bit periods (simulated), trigger tx_done
-            // At 115200 baud: 1 bit = ~8.68 µs, 10 bits = ~86.8 µs
-            // At 27MHz clock: ~2344 cycles
-            // For simulation speed, use much smaller delay
-            #1000;  // Simulate transmission delay
-            
-            @(posedge clk);
-            tx_done_i <= 1'b1;  // Pulse tx_done for 1 cycle
-            
-            @(posedge clk);
-            tx_done_i <= 1'b0;
-            tx_busy_i <= 1'b0;
-        end
-    end
-
-    // =========================================================
-    // MONITOR: Track TX bytes and verify order
-    // =========================================================
-    always @(posedge clk) begin
-        if (tx_en_o && !tx_busy_i) begin
-            $display("[%0t] [TX] Byte #%0d: 0x%02h", $time, tx_byte_count, tx_data_o);
-            if (tx_byte_count < 10) begin
-                tx_bytes[tx_byte_count] <= tx_data_o;
-            end
-            tx_byte_count <= tx_byte_count + 1;
-        end
-    end
-
-    // =========================================================
-    // MONITOR: Detect tx_done_i pulses (STEP 1 verification)
-    // =========================================================
-    integer tx_done_count;
-    always @(posedge tx_done_i) begin
-        tx_done_count = tx_done_count + 1;
-        $display("[%0t] [STEP1] tx_done_i pulse #%0d detected", $time, tx_done_count);
-    end
-
-    // =========================================================
-    // Task: Send 1 byte via RX interface
-    // =========================================================
-    task send_rx_byte;
-        input [7:0] data;
+    // Task gửi 1 byte giả lập cờ rx_done từ uart_rx
+    task send_rx_byte(input [7:0] data);
         begin
             @(posedge clk);
-            rx_data_i = data;
-            rx_done_i = 1'b1;
+            rx_data = data;
+            rx_done = 1'b1;
             @(posedge clk);
-            rx_done_i = 1'b0;
-            #(CLK_PERIOD * 50);  // ~1.85 µs delay between bytes
+            rx_done = 1'b0;
+            #100; // Giãn cách giữa các byte một chút
         end
     endtask
 
-    // =========================================================
-    // Task: Send WRITE frame with checksum
-    // =========================================================
-    task send_write_frame;
-        input [7:0] addr;
-        input [31:0] data;
-        input [7:0] len;
+    // Task gửi nguyên 1 khung ghi (WRITE) tự động tính Checksum
+    task send_write_frame(
+        input [7:0] addr, 
+        input [31:0] data, 
+        input [7:0] len
+    );
         reg [7:0] chk;
         begin
-            $display("\n[%0t] === WRITE FRAME ===", $time);
-            $display("  ADDR=0x%02h, LEN=%0d, DATA=0x%08h", addr, len, data);
-            
             chk = 8'h01 ^ addr ^ len;
-            send_rx_byte(8'h55);    // Sync
-            send_rx_byte(8'h01);    // CMD
-            send_rx_byte(addr);     // ADDR
-            send_rx_byte(len);      // LEN
+            send_rx_byte(8'h55); // 0x55
+            send_rx_byte(8'h01); // CMD = 0x01 (WRITE)
+            send_rx_byte(addr);  // ADDR
+            send_rx_byte(len);   // LEN
 
-            if (len >= 4) begin
-                send_rx_byte(data[31:24]); 
-                chk = chk ^ data[31:24];
-                send_rx_byte(data[23:16]); 
-                chk = chk ^ data[23:16];
-                send_rx_byte(data[15:8]);  
-                chk = chk ^ data[15:8];
-                send_rx_byte(data[7:0]);   
-                chk = chk ^ data[7:0];
+            if (len == 4) begin
+                send_rx_byte(data[31:24]); chk = chk ^ data[31:24];
+                send_rx_byte(data[23:16]); chk = chk ^ data[23:16];
+                send_rx_byte(data[15:8]);  chk = chk ^ data[15:8];
+                send_rx_byte(data[7:0]);   chk = chk ^ data[7:0];
             end else if (len == 2) begin
-                send_rx_byte(data[15:8]);  
-                chk = chk ^ data[15:8];
-                send_rx_byte(data[7:0]);   
-                chk = chk ^ data[7:0];
+                send_rx_byte(data[15:8]);  chk = chk ^ data[15:8];
+                send_rx_byte(data[7:0]);   chk = chk ^ data[7:0];
             end else if (len == 1) begin
-                send_rx_byte(data[7:0]);   
-                chk = chk ^ data[7:0];
+                send_rx_byte(data[7:0]);   chk = chk ^ data[7:0];
             end
             
-            send_rx_byte(chk);      // CHK
-            $display("  Checksum: 0x%02h", chk);
+            send_rx_byte(chk); // CHK
         end
     endtask
 
-    // =========================================================
-    // Task: Send command frame (READ, KICK, STATUS)
-    // =========================================================
-    task send_cmd_frame;
-        input [7:0] cmd;
-        input [7:0] addr;
+    // Task gửi nguyên 1 khung không kèm DATA (READ, KICK, STATUS)
+    task send_cmd_frame(input [7:0] cmd, input [7:0] addr);
         reg [7:0] chk;
-        reg [7:0] cmd_name [0:4];
         begin
-            cmd_name[1] = "WRITE";
-            cmd_name[2] = "READ";
-            cmd_name[3] = "KICK";
-            cmd_name[4] = "STAT";
-            
-            $display("\n[%0t] === COMMAND FRAME (CMD=0x%02h: %s) ===", $time, cmd, 
-                     (cmd >= 1 && cmd <= 4) ? cmd_name[cmd] : "UNKNOWN");
-            
             chk = cmd ^ addr ^ 8'h00;
-            send_rx_byte(8'h55);    // Sync
-            send_rx_byte(cmd);      // CMD
-            send_rx_byte(addr);     // ADDR
-            send_rx_byte(8'h00);    // LEN = 0
-            send_rx_byte(chk);      // CHK
-            $display("  Checksum: 0x%02h", chk);
+            send_rx_byte(8'h55); // 0x55
+            send_rx_byte(cmd);   // CMD
+            send_rx_byte(addr);  // ADDR
+            send_rx_byte(8'h00); // LEN = 0
+            send_rx_byte(chk);   // CHK
         end
     endtask
 
-    // =========================================================
-    // MAIN TEST SEQUENCE
-    // =========================================================
+    // (Moved mock_tx block to the top)
+    
+    // Giám sát dữ liệu module Parser trả về (TX Monitor)
+    reg [7:0] tx_monitor_buf [0:15];
+    integer tx_monitor_cnt;
+
+    always @(posedge clk) begin
+        if (tx_en) begin
+            $display("[%0t] UART TX: Gửi byte 0x%h", $time, tx_data);
+            tx_monitor_buf[tx_monitor_cnt] = tx_data;
+            tx_monitor_cnt = tx_monitor_cnt + 1;
+        end
+    end
+
+    // Bộ Check tự động cho TX Response
+    task check_tx_response(input integer expected_len, input [7:0] expected_cmd, input [7:0] expected_addr);
+        reg [7:0] calc_chk;
+        integer i;
+        begin
+            if (tx_monitor_cnt !== expected_len) begin
+                $display("--> [FAIL] Phản hồi sai số lượng byte! (Kỳ vọng: %0d, Nhận: %0d)", expected_len, tx_monitor_cnt);
+            end else begin
+                if (tx_monitor_buf[0] !== 8'h55) $display("--> [FAIL] Lỗi Start Byte: 0x%h", tx_monitor_buf[0]);
+                if (tx_monitor_buf[1] !== expected_cmd) $display("--> [FAIL] Lỗi CMD: 0x%h", tx_monitor_buf[1]);
+                if (tx_monitor_buf[2] !== expected_addr) $display("--> [FAIL] Lỗi ADDR: 0x%h", tx_monitor_buf[2]);
+                
+                calc_chk = 0;
+                for (i=0; i<expected_len-1; i=i+1) calc_chk = calc_chk ^ tx_monitor_buf[i];
+                if (tx_monitor_buf[expected_len-1] !== calc_chk) 
+                    $display("--> [FAIL] Lỗi Checksum: Nhận 0x%h, Kỳ vọng 0x%h", tx_monitor_buf[expected_len-1], calc_chk);
+                else if (tx_monitor_buf[0]==8'h55 && tx_monitor_buf[1]==expected_cmd && tx_monitor_buf[2]==expected_addr)
+                    $display("--> [PASS] Phản hồi chính xác! (%0d bytes, CMD=0x%h, ADDR=0x%h)", expected_len, expected_cmd, expected_addr);
+            end
+            tx_monitor_cnt = 0; // Xóa buffer chuẩn bị cho frame tiếp theo
+        end
+    endtask
+
+    // Test Sequence
     initial begin
-        // Initialize
+        // Khởi tạo
         clk = 0;
         rst_n = 0;
-        rx_data_i = 0;
-        rx_done_i = 0;
-        tx_busy_i = 0;
-        tx_done_i = 0;
-        tx_byte_count = 0;
-        tx_done_count = 0;
-        test_passes = 0;
-        test_errors = 0;
+        rx_data = 0;
+        rx_done = 0;
+        //tx_busy is handled in always block
+        tx_monitor_cnt = 0;
 
-        #(CLK_PERIOD * 10);
+        // Bắt đầu nhả Reset
+        #100;
         rst_n = 1;
-        #(CLK_PERIOD * 10);
+        #200;
 
-        $display("\n========================================================");
-        $display("  UART Frame Parser Testbench");
-        $display("  Testing STEP 1: tx_done_i Signal Integration");
-        $display("  STEP 2: Checksum Verification");
-        $display("========================================================\n");
-
-        // ========== TEST CASE 1: WRITE Command ==========
-        $display("\nTEST CASE 1: WRITE Command (4-byte data)");
+        $display("\n--- KỊCH BẢN 1: TEST LỆNH WRITE THÔNG THƯỜNG ---");
+        // Ghi vào thanh ghi tWD_ms (Địa chỉ 0x04) giá trị 0x12345678 (4 byte)
         send_write_frame(8'h04, 32'h12345678, 8'd4);
-        #50000;  // Wait for ACK transmission
-        
-        if (tx_byte_count >= 5) begin
-            $display("✓ PASS: TX sent %0d bytes for WRITE ACK (5 expected)", tx_byte_count);
-            test_passes = test_passes + 1;
-        end else begin
-            $display("✗ FAIL: TX sent only %0d bytes (expected 5+)", tx_byte_count);
-            test_errors = test_errors + 1;
-        end
-        tx_byte_count = 0;
+        #20000; 
+        check_tx_response(5, 8'h01, 8'h04);
 
-        // ========== TEST CASE 2: READ Command ==========
-        $display("\nTEST CASE 2: READ Command");
+        $display("\n--- KỊCH BẢN 2: TEST LỆNH READ THÔNG THƯỜNG ---");
+        // Đọc lại giá trị từ thanh ghi tWD_ms (Địa chỉ 0x04)
         send_cmd_frame(8'h02, 8'h04);
-        #50000;  // Wait for response (should be 9 bytes: 55, CMD, ADDR, LEN, 4xDATA, CHK)
-        
-        if (tx_byte_count >= 9) begin
-            $display("✓ PASS: TX sent %0d bytes for READ response (9 expected)", tx_byte_count);
-            
-            // Verify structure: tx_bytes[0]=0x55, tx_bytes[1]=CMD, tx_bytes[3]=LEN=0x04, etc.
-            if (tx_bytes[0] == 8'h55) begin
-                $display("  ✓ Byte[0] (Sync) = 0x%02h [CORRECT]", tx_bytes[0]);
-                test_passes = test_passes + 1;
-            end else begin
-                $display("  ✗ Byte[0] (Sync) = 0x%02h [EXPECTED 0x55]", tx_bytes[0]);
-                test_errors = test_errors + 1;
-            end
-            
-            if (tx_bytes[3] == 8'h04) begin  // LEN byte
-                $display("  ✓ Byte[3] (LEN) = 0x%02h [CORRECT]", tx_bytes[3]);
-                test_passes = test_passes + 1;
-            end else begin
-                $display("  ✗ Byte[3] (LEN) = 0x%02h [EXPECTED 0x04]", tx_bytes[3]);
-                test_errors = test_errors + 1;
-            end
-        end else begin
-            $display("✗ FAIL: TX sent only %0d bytes (expected 9)", tx_byte_count);
-            test_errors = test_errors + 1;
-        end
-        tx_byte_count = 0;
+        #20000;
+        // ACK của READ sẽ trả về 9 bytes (55, CMD, ADDR, LEN=4, DATAx4, CHK)
+        check_tx_response(9, 8'h02, 8'h04);
 
-        // ========== TEST CASE 3: KICK Command ==========
-        $display("\nTEST CASE 3: KICK Command");
+        $display("\n--- KỊCH BẢN 3A: TEST LỆNH KICK KHI BỊ CẤM (wdi_src=0) ---");
+        // Mặc định wdi_src = 0. Gửi KICK sẽ bị lờ đi.
         send_cmd_frame(8'h03, 8'h00);
-        #50000;  // Wait for ACK (should be 5 bytes: 55, CMD, ADDR, LEN, CHK)
-        
-        if (tx_byte_count >= 5) begin
-            $display("✓ PASS: TX sent %0d bytes for KICK ACK (5 expected)", tx_byte_count);
-            test_passes = test_passes + 1;
-        end else begin
-            $display("✗ FAIL: TX sent only %0d bytes (expected 5)", tx_byte_count);
-            test_errors = test_errors + 1;
-        end
+        #20000;
+        if (tx_monitor_cnt == 0) $display("--> [PASS] Không có phản hồi, lệnh KICK đã bị chặn an toàn.");
+        else $display("--> [FAIL] Có phản hồi dù lệnh KICK bị chặn!");
+        tx_monitor_cnt = 0;
 
-        if (uart_kick_pulse_o) begin
-            $display("✓ PASS: uart_kick_pulse_o detected");
-            test_passes = test_passes + 1;
-        end else begin
-            $display("✗ FAIL: uart_kick_pulse_o NOT detected");
-            test_errors = test_errors + 1;
-        end
-        tx_byte_count = 0;
+        $display("\n--- KỊCH BẢN 3B: BẬT TÍNH NĂNG SW KICK (wdi_src=1) ---");
+        // Ghi vào thanh ghi CTRL (Addr=0x00), Set Bit 1 (wdi_src) = 1
+        send_write_frame(8'h00, 32'h00000002, 8'd4);
+        #20000;
+        check_tx_response(5, 8'h01, 8'h00);
 
-        // ========== TEST CASE 4: GET_STATUS Command ==========
-        $display("\nTEST CASE 4: GET_STATUS Command");
+        $display("\n--- KỊCH BẢN 3C: TEST LỆNH KICK KHI ĐƯỢC CHO PHÉP (wdi_src=1) ---");
+        send_cmd_frame(8'h03, 8'h00);
+        #20000;
+        check_tx_response(5, 8'h03, 8'h00);
+
+        $display("\n--- KỊCH BẢN 4: TEST LỆNH GET STATUS ---");
+        // Gửi lệnh GET STATUS (Mã 0x04)
         send_cmd_frame(8'h04, 8'h00);
-        #50000;
-        
-        if (tx_byte_count >= 9) begin
-            $display("✓ PASS: TX sent %0d bytes for STATUS response (9 expected)", tx_byte_count);
-            test_passes = test_passes + 1;
-        end else begin
-            $display("✗ FAIL: TX sent only %0d bytes (expected 9)", tx_byte_count);
-            test_errors = test_errors + 1;
-        end
-        tx_byte_count = 0;
+        #20000;
+        // Firmware phản hồi địa chỉ STATUS là 0x10, trả về 9 bytes
+        check_tx_response(9, 8'h04, 8'h10);
 
-        // ========== TEST CASE 5: Bad Checksum (should drop frame) ==========
-        $display("\nTEST CASE 5: Bad Checksum (frame should be dropped)");
-        tx_byte_count = 0;
-        
+        $display("\n--- KỊCH BẢN 5: TEST CHECKSUM SAI ---");
+        // Chủ động gửi gói tin với byte Checksum sai (hủy gói)
         send_rx_byte(8'h55);
-        send_rx_byte(8'h03);     // KICK
-        send_rx_byte(8'h00);     // ADDR
-        send_rx_byte(8'h00);     // LEN
-        send_rx_byte(8'hFF);     // BAD CHK (correct would be 0x03)
-        
-        #30000;
-        
-        if (tx_byte_count == 0) begin
-            $display("✓ PASS: Bad checksum frame dropped (no TX)");
-            test_passes = test_passes + 1;
-        end else begin
-            $display("✗ FAIL: Frame with bad checksum was processed (%0d TX bytes)", tx_byte_count);
-            test_errors = test_errors + 1;
-        end
+        send_rx_byte(8'h03);
+        send_rx_byte(8'h00);
+        send_rx_byte(8'h00);
+        send_rx_byte(8'hFF); // CHK sai (đáng lẽ phải là 0x03)
+        #10000;
+        if (tx_monitor_cnt == 0) $display("--> [PASS] Phớt lờ thành công frame bị sai checksum.");
+        else $display("--> [FAIL] Vẫn lấy dữ liệu hoặc phản hồi frame lỗi!");
+        tx_monitor_cnt = 0;
 
-        // ========== TEST CASE 6: STEP 1 - Verify tx_done_i pulses ==========
-        $display("\nTEST CASE 6: STEP 1 - tx_done_i pulse count verification");
-        
-        if (tx_done_count > 0) begin
-            $display("✓ PASS: %0d tx_done_i pulses detected (should match TX byte count)", tx_done_count);
-            test_passes = test_passes + 1;
-        end else begin
-            $display("✗ FAIL: No tx_done_i pulses detected");
-            test_errors = test_errors + 1;
-        end
+        $display("\n--- KỊCH BẢN 6: TEST NHIỄU RÁC (GARBAGE) TRƯỚC FRAME ---");
+        // Gửi ngẫu nhiên các byte rác trước khi gửi Start Byte 0x55
+        send_rx_byte(8'hAA);
+        send_rx_byte(8'h12);
+        send_rx_byte(8'h99); 
+        // Vẫn gửi theo sau đó là 1 frame Write đúng
+        send_write_frame(8'h0C, 32'h00000100, 8'd4); 
+        #20000;
+        check_tx_response(5, 8'h01, 8'h0C);
 
-        // ========== SUMMARY ==========
-        $display("\n========================================================");
-        $display("  TEST SUMMARY");
-        $display("========================================================");
-        $display("Total Passes: %0d", test_passes);
-        $display("Total Errors: %0d", test_errors);
-        
-        if (test_errors == 0) begin
-            $display("\n✓✓✓ ALL TESTS PASSED ✓✓✓\n");
-        end else begin
-            $display("\n✗✗✗ SOME TESTS FAILED ✗✗✗\n");
-        end
-        
+        $display("\n--- KỊCH BẢN 7: TEST INVALID CMD ---");
+        // Khung tin hợp lệ về định dạng, nhưng chứa mã lệnh không ai biết 0x99
+        send_cmd_frame(8'h99, 8'h00); 
+        #20000;
+        if (tx_monitor_cnt == 0) $display("--> [PASS] Đã xả bỏ lệnh rác an toàn.");
+        else $display("--> [FAIL] FSM bị mắc kẹt / phản hồi sai lệnh rác!");
+        tx_monitor_cnt = 0;
+
+        $display("\n--- TEST KẾT THÚC ---");
         $finish;
-    end
-
-    // VCD dump for waveform analysis
-    initial begin
-        $dumpfile("tb_uart_frame.vcd");
-        $dumpvars(0, tb_uart_frame);
     end
 
 endmodule

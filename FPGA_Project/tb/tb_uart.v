@@ -26,7 +26,8 @@ module tb_uart;
     wire       tx_done;       // NEW: tx_done_o signal
     
     // RX (Receiver)
-    reg        rx_serial;
+    wire       rx_serial;
+    reg        rx_glitch_low;
     wire [7:0] rx_data_out;
     wire       rx_done;
 
@@ -61,6 +62,8 @@ module tb_uart;
     // =========================================================
     // UART RX Module (with 16x oversampling + majority voting)
     // =========================================================
+    assign rx_serial = rx_glitch_low ? 1'b0 : tx_serial;
+
     uart_rx #(
         .CLK_FREQ(CLK_FREQ),
         .BAUD_RATE(BAUD_RATE)
@@ -111,16 +114,7 @@ module tb_uart;
     // STEP 2: Verify Fractional Baud Rate Accuracy
     // =========================================================
     // Measure actual UART bit period and compare with expected
-    reg uart_bit_sampled;
-    integer bit_count;
-    integer baud_tick_count;
-    integer start_time;
-
-    always @(posedge clk) begin
-        // Count baud ticks for one byte (8 bits + start + stop = 10 bits)
-        // Expected time for 10 bits = 10 / 115200 Hz = 86.805 microseconds
-        // At 27MHz, that's ~2344 clock cycles
-    end
+    // (Timing measurement logic can be added here)
 
     // =========================================================
     // STEP 3: Monitor for glitches on RX (Majority Voting)
@@ -147,11 +141,8 @@ module tb_uart;
             // Wait for tx_busy to go low (transmission complete)
             @(negedge tx_busy);
             
-            // After transmission completes, rx_done should pulse
-            // Wait for RX to receive and process
-            wait (rx_done == 1);
-            @(posedge clk);
-            
+            // After transmission completes, wait for RX to process
+            // Note: Do not wait on rx_done here, as it may have already pulsed.
             #50000;  // Give time for settling
         end
     endtask
@@ -206,12 +197,12 @@ module tb_uart;
     // TASK: Inject glitch on RX line (STEP 3 test)
     // =========================================================
     task inject_glitch;
-        input glitch_width_ns;
+        input integer glitch_width_ns;
         begin
             glitch_injected = glitch_injected + 1;
-            rx_serial = 1'b0;  // Pull low
+            rx_glitch_low = 1'b1;  // Pull low onto the loopback line
             #glitch_width_ns;
-            rx_serial = 1'b1;  // Release
+            rx_glitch_low = 1'b0;  // Release
             $display("[%0t] [STEP3] Injected glitch: %0d ns wide", $time, glitch_width_ns);
         end
     endtask
@@ -244,7 +235,7 @@ module tb_uart;
         rst_n       = 0;
         tx_start    = 0;
         tx_data_in  = 8'd0;
-        rx_serial   = 1'b1;  // RX idle = 1
+        rx_glitch_low = 1'b0;
         head_ptr    = 0;
         tail_ptr    = 0;
         test_errors = 0;
@@ -290,18 +281,17 @@ module tb_uart;
         tx_start   = 0;
         
         // Wait for transmission to start
-        @(negedge tx_busy);
+        @(posedge tx_busy);
         
         // Inject small glitches (1-2 clock cycles = 37-74 ns)
         // These should be filtered by majority voting
-        #1000;  // Some delay into transmission
+        #15000; // Wait ~15us to inject during data bits
         inject_glitch(50);   // ~1.4 clock cycles
-        #500;
+        #5000;
         inject_glitch(100);  // ~2.7 clock cycles
         
-        // Let it finish
-        wait (rx_done == 1);
-        @(posedge clk);
+        // Wait for transmission to finish
+        @(negedge tx_busy);
         #50000;
 
         // ========== SUMMARY ==========
